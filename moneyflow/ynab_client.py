@@ -445,12 +445,24 @@ class YNABClient:
         """
         Convert a YNAB transaction to moneyflow-compatible format.
 
+        Special handling for income:
+        - Transactions with category "Inflow: Ready to Assign"
+          are marked as income type
+
         Args:
             txn: YNAB TransactionDetail object
 
         Returns:
             Dictionary in moneyflow format
         """
+        # Determine category group type
+        category_name = txn.category_name or "Uncategorized"
+        category_group_type = "expense"  # Default
+
+        # Detect income transactions
+        if category_name == "Inflow: Ready to Assign":
+            category_group_type = "income"
+
         return {
             "id": txn.id,
             "date": str(txn.var_date),
@@ -461,7 +473,12 @@ class YNABClient:
             },
             "category": {
                 "id": txn.category_id or "uncategorized",
-                "name": txn.category_name or "Uncategorized",
+                "name": category_name,
+                "group": {
+                    "id": "grp_income" if category_group_type == "income" else "grp_expense",
+                    "name": "Income" if category_group_type == "income" else "Expense",
+                    "type": category_group_type,
+                },
             },
             "account": {
                 "id": txn.account_id,

@@ -451,9 +451,8 @@ class DataManager:
         """
         Convert raw transaction data to Polars DataFrame with enriched fields.
 
-        Note: Does NOT include 'group' field - groups are applied dynamically
-        via apply_category_groups() so changes to config.yaml take effect
-        on cached data.
+        Note: Includes 'group' field if provided by backend (e.g., YNAB's Income/Expense).
+        For backends without group info, apply_category_groups() fills it from config.yaml.
         """
         if not transactions:
             return pl.DataFrame()
@@ -468,6 +467,11 @@ class DataManager:
             category_id = category_obj.get("id", "")
             category_name = category_obj.get("name", "Uncategorized")
 
+            # Extract group name from transaction if available (e.g., YNAB backend)
+            # Otherwise, it will be added dynamically via apply_category_groups()
+            group_obj = category_obj.get("group", {}) or {}
+            group_name = group_obj.get("name", "") if group_obj else ""
+
             row = {
                 "id": str(txn.get("id", "")),
                 "date": str(txn.get("date", "")),
@@ -478,7 +482,9 @@ class DataManager:
                 "merchant_id": str(merchant_obj.get("id", "")),
                 "category": str(category_name if category_name else "Uncategorized"),
                 "category_id": str(category_id),
-                # Note: 'group' field NOT included here - added dynamically
+                # Include 'group' field if provided by backend (e.g., YNAB)
+                # Otherwise, it will be added dynamically by apply_category_groups()
+                "group": str(group_name) if group_name else "",
                 "account": str(
                     account_obj.get("displayName", "") if account_obj.get("displayName") else ""
                 ),
@@ -507,6 +513,9 @@ class DataManager:
         Called after loading data (from API or cache) so that changes to
         config.yaml always take effect.
 
+        If the backend already provided a group name (e.g., YNAB with Income/Expense),
+        that value is preserved. Only empty group values are filled from the mapping.
+
         Args:
             df: DataFrame with 'category' column
 
@@ -521,10 +530,21 @@ class DataManager:
         def get_group(category: str) -> str:
             return self.category_to_group.get(category, "Uncategorized")
 
-        # Apply mapping - use Polars map_elements for efficient lookup
-        df = df.with_columns(
-            pl.col("category").map_elements(get_group, return_dtype=pl.String).alias("group")
-        )
+        # Check if 'group' column already exists
+        if "group" in df.columns:
+            # Only update rows where group is empty (backend didn't provide it)
+            # This preserves YNAB's Income/Expense groups while filling others from config
+            df = df.with_columns(
+                pl.when(pl.col("group") == "")
+                .then(pl.col("category").map_elements(get_group, return_dtype=pl.String))
+                .otherwise(pl.col("group"))
+                .alias("group")
+            )
+        else:
+            # Add 'group' column if it doesn't exist
+            df = df.with_columns(
+                pl.col("category").map_elements(get_group, return_dtype=pl.String).alias("group")
+            )
 
         return df
 

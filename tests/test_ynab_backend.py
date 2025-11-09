@@ -649,3 +649,281 @@ class TestYNABBackend:
         assert "duplicate" in result["message"].lower()
         assert "duplicate_ids" in result
         assert len(result["duplicate_ids"]) == 2
+
+    # Tests for income transaction recognition
+
+    @pytest.mark.asyncio
+    async def test_inflow_ready_to_assign_marked_as_income(self, backend, mock_ynab_api):
+        """Test that 'Inflow: Ready to Assign' transactions are marked as income."""
+        backend.client.budget_id = "test-budget-id"
+        backend.client.access_token = "test-token"
+        backend.client.api_client = MagicMock()
+
+        # Mock income transaction
+        mock_txn = MagicMock()
+        mock_txn.id = "txn-paycheck"
+        mock_txn.var_date = "2025-01-15"
+        mock_txn.amount = 5000000  # $5000 paycheck
+        mock_txn.payee_id = "payee-employer"
+        mock_txn.payee_name = "Acme Corp"
+        mock_txn.category_id = "cat-income"
+        mock_txn.category_name = "Inflow: Ready to Assign"
+        mock_txn.account_id = "acc-checking"
+        mock_txn.account_name = "Checking"
+        mock_txn.memo = "Paycheck"
+        mock_txn.deleted = False
+        mock_txn.transfer_account_id = None
+        mock_txn.cleared = "cleared"
+
+        mock_response = MagicMock()
+        mock_response.data.transactions = [mock_txn]
+
+        mock_transactions_api = MagicMock()
+        mock_transactions_api.get_transactions.return_value = mock_response
+
+        mock_ynab_api.TransactionsApi.return_value = mock_transactions_api
+
+        result = await backend.get_transactions(limit=10)
+
+        # Verify transaction is marked as income
+        txn = result["allTransactions"]["results"][0]
+        assert txn["category"]["name"] == "Inflow: Ready to Assign"
+        assert txn["category"]["group"]["type"] == "income"
+        assert txn["category"]["group"]["name"] == "Income"
+        assert txn["amount"] == 5000.0  # Positive amount
+
+    def test_regular_expense_marked_as_expense(self, backend):
+        """Test that regular expense transactions are marked as expense type."""
+        backend.client._account_cache = None
+
+        mock_txn = MagicMock()
+        mock_txn.id = "txn-grocery"
+        mock_txn.var_date = "2025-01-15"
+        mock_txn.amount = -50000  # -$50
+        mock_txn.payee_id = "payee-1"
+        mock_txn.payee_name = "Grocery Store"
+        mock_txn.category_id = "cat-groceries"
+        mock_txn.category_name = "Groceries"
+        mock_txn.account_id = "acc-checking"
+        mock_txn.account_name = "Checking"
+        mock_txn.memo = "Weekly shopping"
+        mock_txn.deleted = False
+        mock_txn.transfer_account_id = None
+        mock_txn.cleared = "cleared"
+
+        converted = backend.client._convert_transaction(mock_txn)
+
+        # Verify transaction is marked as expense
+        assert converted["category"]["name"] == "Groceries"
+        assert converted["category"]["group"]["type"] == "expense"
+        assert converted["amount"] == -50.0  # Negative amount
+
+    def test_null_category_marked_as_expense(self, backend):
+        """Test that transactions with null category are marked as expense."""
+        backend.client._account_cache = None
+
+        mock_txn = MagicMock()
+        mock_txn.id = "txn-uncategorized"
+        mock_txn.var_date = "2025-01-15"
+        mock_txn.amount = -25000
+        mock_txn.payee_id = "payee-1"
+        mock_txn.payee_name = "Unknown Store"
+        mock_txn.category_id = None
+        mock_txn.category_name = None
+        mock_txn.account_id = "acc-checking"
+        mock_txn.account_name = "Checking"
+        mock_txn.memo = ""
+        mock_txn.deleted = False
+        mock_txn.transfer_account_id = None
+        mock_txn.cleared = "cleared"
+
+        converted = backend.client._convert_transaction(mock_txn)
+
+        # Null category should default to expense
+        assert converted["category"]["name"] == "Uncategorized"
+        assert converted["category"]["group"]["type"] == "expense"
+
+    def test_inflow_category_case_sensitive(self, backend):
+        """Test that category name matching is case-sensitive."""
+        backend.client._account_cache = None
+
+        # Test lowercase variant
+        mock_txn = MagicMock()
+        mock_txn.id = "txn-1"
+        mock_txn.var_date = "2025-01-15"
+        mock_txn.amount = 100000
+        mock_txn.payee_id = "payee-1"
+        mock_txn.payee_name = "Test"
+        mock_txn.category_id = "cat-1"
+        mock_txn.category_name = "inflow: ready to assign"  # Lowercase
+        mock_txn.account_id = "acc-1"
+        mock_txn.account_name = "Checking"
+        mock_txn.memo = ""
+        mock_txn.deleted = False
+        mock_txn.transfer_account_id = None
+        mock_txn.cleared = "cleared"
+
+        converted = backend.client._convert_transaction(mock_txn)
+
+        # Should NOT match (case-sensitive)
+        assert converted["category"]["group"]["type"] == "expense"
+
+    @pytest.mark.asyncio
+    async def test_multiple_income_transactions(self, backend, mock_ynab_api):
+        """Test that multiple income transactions are all marked correctly."""
+        backend.client.budget_id = "test-budget-id"
+        backend.client.access_token = "test-token"
+        backend.client.api_client = MagicMock()
+
+        # Create multiple income transactions
+        income_txns = []
+        for i in range(3):
+            mock_txn = MagicMock()
+            mock_txn.id = f"txn-income-{i}"
+            mock_txn.var_date = f"2025-01-{i + 1:02d}"
+            mock_txn.amount = 500000 + (i * 10000)
+            mock_txn.payee_id = f"payee-{i}"
+            mock_txn.payee_name = f"Employer {i}"
+            mock_txn.category_id = "cat-income"
+            mock_txn.category_name = "Inflow: Ready to Assign"
+            mock_txn.account_id = "acc-checking"
+            mock_txn.account_name = "Checking"
+            mock_txn.memo = f"Paycheck {i}"
+            mock_txn.deleted = False
+            mock_txn.transfer_account_id = None
+            mock_txn.cleared = "cleared"
+            income_txns.append(mock_txn)
+
+        mock_response = MagicMock()
+        mock_response.data.transactions = income_txns
+
+        mock_transactions_api = MagicMock()
+        mock_transactions_api.get_transactions.return_value = mock_response
+
+        mock_ynab_api.TransactionsApi.return_value = mock_transactions_api
+
+        result = await backend.get_transactions(limit=10)
+
+        # Verify all are marked as income
+        txns = result["allTransactions"]["results"]
+        assert len(txns) == 3
+        for txn in txns:
+            assert txn["category"]["group"]["type"] == "income"
+            assert txn["amount"] > 0
+
+    @pytest.mark.asyncio
+    async def test_mixed_income_and_expense_transactions(self, backend, mock_ynab_api):
+        """Test that income and expense transactions coexist correctly."""
+        backend.client.budget_id = "test-budget-id"
+        backend.client.access_token = "test-token"
+        backend.client.api_client = MagicMock()
+
+        # Income transaction
+        income_txn = MagicMock()
+        income_txn.id = "txn-income"
+        income_txn.var_date = "2025-01-01"
+        income_txn.amount = 500000
+        income_txn.payee_id = "payee-employer"
+        income_txn.payee_name = "Employer"
+        income_txn.category_id = "cat-income"
+        income_txn.category_name = "Inflow: Ready to Assign"
+        income_txn.account_id = "acc-checking"
+        income_txn.account_name = "Checking"
+        income_txn.memo = "Paycheck"
+        income_txn.deleted = False
+        income_txn.transfer_account_id = None
+        income_txn.cleared = "cleared"
+
+        # Expense transaction
+        expense_txn = MagicMock()
+        expense_txn.id = "txn-expense"
+        expense_txn.var_date = "2025-01-02"
+        expense_txn.amount = -50000
+        expense_txn.payee_id = "payee-grocery"
+        expense_txn.payee_name = "Grocery Store"
+        expense_txn.category_id = "cat-groceries"
+        expense_txn.category_name = "Groceries"
+        expense_txn.account_id = "acc-checking"
+        expense_txn.account_name = "Checking"
+        expense_txn.memo = "Shopping"
+        expense_txn.deleted = False
+        expense_txn.transfer_account_id = None
+        expense_txn.cleared = "cleared"
+
+        mock_response = MagicMock()
+        mock_response.data.transactions = [income_txn, expense_txn]
+
+        mock_transactions_api = MagicMock()
+        mock_transactions_api.get_transactions.return_value = mock_response
+
+        mock_ynab_api.TransactionsApi.return_value = mock_transactions_api
+
+        result = await backend.get_transactions(limit=10)
+
+        # Verify correct categorization
+        txns = result["allTransactions"]["results"]
+        assert len(txns) == 2
+
+        income = [t for t in txns if t["id"] == "txn-income"][0]
+        assert income["category"]["group"]["type"] == "income"
+        assert income["amount"] > 0
+
+        expense = [t for t in txns if t["id"] == "txn-expense"][0]
+        assert expense["category"]["group"]["type"] == "expense"
+        assert expense["amount"] < 0
+
+    def test_income_group_name_in_transaction_structure(self, backend):
+        """Test that the transaction structure includes the group name for dataframe."""
+        backend.client._account_cache = None
+
+        # Income transaction
+        mock_txn = MagicMock()
+        mock_txn.id = "txn-income"
+        mock_txn.var_date = "2025-01-15"
+        mock_txn.amount = 500000
+        mock_txn.payee_id = "payee-1"
+        mock_txn.payee_name = "Employer"
+        mock_txn.category_id = "cat-income"
+        mock_txn.category_name = "Inflow: Ready to Assign"
+        mock_txn.account_id = "acc-1"
+        mock_txn.account_name = "Checking"
+        mock_txn.memo = ""
+        mock_txn.deleted = False
+        mock_txn.transfer_account_id = None
+        mock_txn.cleared = "cleared"
+
+        converted = backend.client._convert_transaction(mock_txn)
+
+        # Verify the nested structure that dataframe will read
+        assert "category" in converted
+        assert "group" in converted["category"]
+        assert converted["category"]["group"]["name"] == "Income"
+        assert converted["category"]["group"]["type"] == "income"
+
+    def test_expense_group_name_in_transaction_structure(self, backend):
+        """Test that expense transactions include the group name for dataframe."""
+        backend.client._account_cache = None
+
+        # Expense transaction
+        mock_txn = MagicMock()
+        mock_txn.id = "txn-expense"
+        mock_txn.var_date = "2025-01-15"
+        mock_txn.amount = -50000
+        mock_txn.payee_id = "payee-1"
+        mock_txn.payee_name = "Store"
+        mock_txn.category_id = "cat-1"
+        mock_txn.category_name = "Groceries"
+        mock_txn.account_id = "acc-1"
+        mock_txn.account_name = "Checking"
+        mock_txn.memo = ""
+        mock_txn.deleted = False
+        mock_txn.transfer_account_id = None
+        mock_txn.cleared = "cleared"
+
+        converted = backend.client._convert_transaction(mock_txn)
+
+        # Verify the nested structure that dataframe will read
+        assert "category" in converted
+        assert "group" in converted["category"]
+        assert converted["category"]["group"]["name"] == "Expense"
+        assert converted["category"]["group"]["type"] == "expense"

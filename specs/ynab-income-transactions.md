@@ -672,15 +672,87 @@ Add to next release:
   transactions as income for better income vs. expense reporting
 ```
 
+## Phase 2: DataFrame Integration (COMPLETED)
+
+### Problem Discovered
+
+After implementing Phase 1, the UI still showed "$0" for income despite transactions being correctly marked with `category.group.type = "income"`. Root cause: The dataframe extraction logic (`_transactions_to_dataframe()`) wasn't reading the `category.group.name` field from transactions.
+
+### Solution
+
+**Location:** `moneyflow/data_manager.py`
+
+#### Change 1: Extract Group Name in `_transactions_to_dataframe()` (lines 461-498)
+
+```python
+# Extract group name from transaction if available (e.g., YNAB backend)
+# Otherwise, it will be added dynamically via apply_category_groups()
+group_obj = category_obj.get("group", {}) or {}
+group_name = group_obj.get("name", "") if group_obj else ""
+
+row = {
+    # ... other fields ...
+    # Include 'group' field if provided by backend (e.g., YNAB)
+    # Otherwise, it will be added dynamically by apply_category_groups()
+    "group": str(group_name) if group_name else "",
+    # ... other fields ...
+}
+```
+
+**Key insight:** Previously, the dataframe had no "group" column when first created. Now it includes it if the backend provides it.
+
+#### Change 2: Preserve Backend Groups in `apply_category_groups()` (lines 508-550)
+
+```python
+# Check if 'group' column already exists
+if "group" in df.columns:
+    # Only update rows where group is empty (backend didn't provide it)
+    # This preserves YNAB's Income/Expense groups while filling others from config
+    df = df.with_columns(
+        pl.when(pl.col("group") == "")
+        .then(pl.col("category").map_elements(get_group, return_dtype=pl.String))
+        .otherwise(pl.col("group"))
+        .alias("group")
+    )
+else:
+    # Add 'group' column if it doesn't exist
+    df = df.with_columns(
+        pl.col("category").map_elements(get_group, return_dtype=pl.String).alias("group")
+    )
+```
+
+**Key insight:** Previously, this function always overwrote the "group" column from config.yaml. Now it preserves backend-provided groups (like YNAB's "Income"/"Expense") and only fills empty values from config.
+
+### Testing
+
+Added 2 additional tests to verify dataframe integration:
+
+- `test_income_group_name_in_transaction_structure` - Verifies Income group in transaction dict
+- `test_expense_group_name_in_transaction_structure` - Verifies Expense group in transaction dict
+
+**Results:**
+- All 1031 tests pass (no regressions)
+- 32 YNAB backend tests pass (8 total income-related tests)
+- Type checking passes (0 errors)
+- Code quality passes (ruff)
+
+### Impact
+
+- **YNAB backend:** Income now correctly aggregated in UI stats (In: field)
+- **Other backends:** Continue to work with config.yaml mapping (no changes needed)
+- **Backward compatible:** No breaking changes
+
 ## Implementation Checklist
 
-- [ ] Update `_convert_transaction()` to detect income category
-- [ ] Add `category_group_type` logic based on category name
-- [ ] Write 7 unit tests covering various scenarios
+- [x] Update `_convert_transaction()` to detect income category
+- [x] Add `category_group_type` logic based on category name
+- [x] Write 8 unit tests covering various scenarios
+- [x] Fix dataframe extraction to read category.group.name
+- [x] Update apply_category_groups() to preserve backend groups
 - [ ] Write integration test with real YNAB API
 - [ ] Manual testing with real YNAB account
-- [ ] Run full test suite (`uv run pytest -v`)
-- [ ] Run type checker (`uv run pyright moneyflow/`)
+- [x] Run full test suite (`uv run pytest -v`) - 1031 tests pass
+- [x] Run type checker (`uv run pyright moneyflow/`) - 0 errors
 - [ ] Update user documentation (docs/guide/ynab.md)
 - [ ] Consider future enhancements (split transactions, UI support)
 

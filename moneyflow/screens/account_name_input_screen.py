@@ -3,11 +3,11 @@
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
-from textual.screen import Screen
+from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
 
 
-class AccountNameInputScreen(Screen):
+class AccountNameInputScreen(ModalScreen):
     """
     Screen to prompt user for account name when adding a new account.
 

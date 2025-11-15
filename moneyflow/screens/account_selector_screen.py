@@ -5,13 +5,13 @@ from datetime import datetime
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, ScrollableContainer
-from textual.screen import Screen
+from textual.screen import ModalScreen
 from textual.widgets import Button, Label, Static
 
 from ..account_manager import Account, AccountManager
 
 
-class AccountSelectorScreen(Screen):
+class AccountSelectorScreen(ModalScreen):
     """
     Account selection screen shown on startup.
 

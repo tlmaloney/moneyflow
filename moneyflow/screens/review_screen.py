@@ -3,11 +3,11 @@
 from textual.app import ComposeResult
 from textual.containers import Container
 from textual.events import Key
-from textual.screen import Screen
+from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Label, Static
 
 
-class ReviewChangesScreen(Screen):
+class ReviewChangesScreen(ModalScreen):
     """Screen to review pending changes before committing to API."""
 
     CSS = """

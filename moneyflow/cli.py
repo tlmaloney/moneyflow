@@ -12,6 +12,58 @@ import click
 from .formatters import ViewPresenter
 
 
+def _get_amazon_backend_with_profile_support(db_path=None, config_dir=None):
+    """
+    Helper to create an AmazonBackend with profile-aware database path resolution.
+
+    Priority:
+    1. Explicit --db-path (if provided)
+    2. Migrated profile path (if amazon account exists in profiles)
+    3. Legacy location (~/.moneyflow/amazon.db as fallback)
+
+    Args:
+        db_path: Optional explicit database path
+        config_dir: Optional config directory
+
+    Returns:
+        tuple: (backend, config_dir, profile_dir)
+    """
+    from pathlib import Path
+
+    from moneyflow.account_manager import AccountManager
+    from moneyflow.backends.amazon import AmazonBackend
+
+    # Ensure config_dir has a value
+    if config_dir is None:
+        config_dir = str(Path.home() / ".moneyflow")
+
+    # Determine the correct db_path
+    # Priority: 1) explicit --db-path, 2) migrated profile, 3) legacy location
+    amazon_profile_dir = None
+    if db_path is None:
+        # Check if Amazon account exists in profiles
+        config_path = Path(config_dir)
+        account_manager = AccountManager(config_dir=config_path)
+        accounts = account_manager.list_accounts()
+
+        # Look for an amazon account
+        amazon_account = None
+        for account in accounts:
+            if account.backend_type == "amazon":
+                amazon_account = account
+                break
+
+        if amazon_account:
+            # Use migrated profile path
+            amazon_profile_dir = account_manager.get_profile_dir(amazon_account.id)
+            db_path = str(amazon_profile_dir / "amazon.db")
+        # else: db_path stays None, AmazonBackend will use default
+
+    backend = AmazonBackend(db_path=db_path, config_dir=config_dir, profile_dir=amazon_profile_dir)
+
+    return backend, config_dir, amazon_profile_dir
+
+
 @click.group(invoke_without_command=True)
 @click.option(
     "--year",
@@ -29,9 +81,9 @@ from .formatters import ViewPresenter
     "--mtd", is_flag=True, help="Load month-to-date transactions (from 1st of current month)"
 )
 @click.option(
-    "--cache",
+    "--no-cache",
     is_flag=True,
-    help="Enable caching (uses ~/.moneyflow/cache by default)",
+    help="Disable encrypted caching (caching is enabled by default)",
 )
 @click.option("--refresh", is_flag=True, help="Force refresh from API, skip cache even if valid")
 @click.option(
@@ -44,11 +96,14 @@ from .formatters import ViewPresenter
     help="Config directory (default: ~/.moneyflow). Useful for testing with isolated configs.",
 )
 @click.pass_context
-def cli(ctx, year, since, mtd, cache, refresh, demo, config_dir):
+def cli(ctx, year, since, mtd, no_cache, refresh, demo, config_dir):
     """moneyflow - Terminal UI for personal finance management.
 
     Run with no arguments to launch the default backend (Monarch Money).
     Use subcommands for other backends (e.g., 'moneyflow amazon').
+
+    Caching is now ENABLED BY DEFAULT with encrypted cache files.
+    Use --no-cache to disable caching.
     """
     # If a subcommand is provided, don't launch default backend
     if ctx.invoked_subcommand is not None:
@@ -57,11 +112,15 @@ def cli(ctx, year, since, mtd, cache, refresh, demo, config_dir):
     # Launch default backend (Monarch Money)
     from moneyflow.app import launch_monarch_mode
 
-    # Convert cache flag to path (None if not enabled, respect config_dir if enabled)
-    if cache:
-        cache_path = f"{config_dir}/cache" if config_dir else "~/.moneyflow/cache"
-    else:
+    # Convert no-cache flag to cache path
+    # Caching is enabled by default (unless --no-cache is passed)
+    if no_cache:
         cache_path = None
+    else:
+        # Enable caching with default location
+        # Use empty string to trigger profile-specific cache directory logic in app.py
+        # If config_dir is specified, use that; otherwise empty string for default behavior
+        cache_path = f"{config_dir}/cache" if config_dir else ""
 
     launch_monarch_mode(
         year=year,
@@ -101,40 +160,10 @@ def amazon(ctx, db_path, config_dir):
 
     # If no subcommand, launch the UI
     if ctx.invoked_subcommand is None:
-        from pathlib import Path
-
-        from moneyflow.account_manager import AccountManager
         from moneyflow.app import launch_amazon_mode
-        from moneyflow.backends.amazon import AmazonBackend
 
-        # Ensure config_dir has a value
-        if config_dir is None:
-            config_dir = str(Path.home() / ".moneyflow")
-
-        # Determine the correct db_path
-        # Priority: 1) explicit --db-path, 2) migrated profile, 3) legacy location
-        amazon_profile_dir = None
-        if db_path is None:
-            # Check if Amazon account exists in profiles
-            config_path = Path(config_dir)
-            account_manager = AccountManager(config_dir=config_path)
-            accounts = account_manager.list_accounts()
-
-            # Look for an amazon account
-            amazon_account = None
-            for account in accounts:
-                if account.backend_type == "amazon":
-                    amazon_account = account
-                    break
-
-            if amazon_account:
-                # Use migrated profile path
-                amazon_profile_dir = account_manager.get_profile_dir(amazon_account.id)
-                db_path = str(amazon_profile_dir / "amazon.db")
-            # else: db_path stays None, AmazonBackend will use default
-
-        backend = AmazonBackend(
-            db_path=db_path, config_dir=config_dir, profile_dir=amazon_profile_dir
+        backend, config_dir, amazon_profile_dir = _get_amazon_backend_with_profile_support(
+            db_path=db_path, config_dir=config_dir
         )
 
         # Check if database exists
@@ -155,7 +184,9 @@ def amazon(ctx, db_path, config_dir):
             raise click.Abort()
 
         # Launch the UI
-        launch_amazon_mode(db_path=db_path, config_dir=config_dir, profile_dir=amazon_profile_dir)
+        launch_amazon_mode(
+            db_path=str(backend.db_path), config_dir=config_dir, profile_dir=amazon_profile_dir
+        )
 
 
 @amazon.command(name="import")
@@ -173,14 +204,17 @@ def amazon_import(ctx, orders_dir, force):
     Example:
         moneyflow amazon import ~/Downloads/"Your Orders"
     """
-    from moneyflow.backends.amazon import AmazonBackend
     from moneyflow.importers.amazon_orders_csv import import_amazon_orders
 
     click.echo(f"Importing Amazon orders from {orders_dir}...")
 
     try:
         db_path = ctx.obj.get("db_path")
-        backend = AmazonBackend(db_path=db_path)
+        config_dir = ctx.obj.get("config_dir")
+
+        backend, config_dir, amazon_profile_dir = _get_amazon_backend_with_profile_support(
+            db_path=db_path, config_dir=config_dir
+        )
         stats = import_amazon_orders(orders_dir, backend=backend, force=force)
 
         click.echo("\n✓ Import complete!")
@@ -223,10 +257,12 @@ def amazon_import(ctx, orders_dir, force):
 @click.pass_context
 def amazon_status(ctx):
     """Show Amazon database status and import history."""
-    from moneyflow.backends.amazon import AmazonBackend
-
     db_path = ctx.obj.get("db_path")
-    backend = AmazonBackend(db_path=db_path)
+    config_dir = ctx.obj.get("config_dir")
+
+    backend, config_dir, amazon_profile_dir = _get_amazon_backend_with_profile_support(
+        db_path=db_path, config_dir=config_dir
+    )
 
     # Check if database exists
     if not backend.db_path.exists():
@@ -400,14 +436,34 @@ def categories_audit(config_dir, cache_dir):
     click.echo(f"Loaded {len(known_categories)} categories from config")
     click.echo("Checking cached transaction data...\n")
 
-    # Try to load cached data
-    cache_manager = CacheManager(cache_dir=cache_dir)
+    # Load encryption key from credentials
+    from .credentials import CredentialManager
+
+    config_path = Path(config_dir) if config_dir else None
+    cred_manager = CredentialManager(config_dir=config_path)
+
+    if not cred_manager.credentials_exist():
+        click.echo("❌ No credentials found. Please run moneyflow first to set up credentials.")
+        return
+
+    try:
+        # Load credentials to get encryption key
+        _, encryption_key = cred_manager.load_credentials()
+    except ValueError:
+        click.echo("❌ Incorrect password!")
+        return
+    except Exception as e:
+        click.echo(f"❌ Failed to load credentials: {e}")
+        return
+
+    # Try to load cached data with encryption key
+    cache_manager = CacheManager(cache_dir=cache_dir, encryption_key=encryption_key)
     cached_data = cache_manager.load_cache()
 
     if not cached_data:
         click.echo("❌ No cached data found.")
-        click.echo("\nRun moneyflow with --cache flag first to create cache:")
-        click.echo("  $ moneyflow --cache")
+        click.echo("\nRun moneyflow first to create encrypted cache:")
+        click.echo("  $ moneyflow")
         return
 
     df, _, _, _ = cached_data

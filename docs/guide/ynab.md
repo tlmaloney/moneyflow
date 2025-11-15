@@ -115,6 +115,52 @@ All edits sync back to YNAB immediately after commit. See the [Editing Guide](ed
 
 ---
 
+## Tracking Accounts
+
+YNAB distinguishes between **budget accounts** (on-budget) and **tracking accounts** (off-budget):
+
+### Budget Accounts (on-budget)
+
+- Checking, savings, credit cards, lines of credit
+- Transactions affect your budget
+- **Visible by default** in moneyflow
+
+### Tracking Accounts (off-budget)
+
+- Investment accounts (401k, IRA, brokerage)
+- Mortgages and loans
+- Asset accounts (cars, real estate)
+- Transactions do NOT affect your budget (tracked for net worth only)
+- **Hidden by default** in moneyflow
+
+### Why Are Tracking Accounts Hidden?
+
+Since tracking account transactions don't affect your budget, they're filtered out by default to keep your reports
+focused on actual spending and income.
+
+### Viewing Hidden Transactions
+
+To see transactions from tracking accounts and other hidden items:
+
+1. Press **`f`** to open the filter settings modal
+2. Toggle the visibility settings for hidden transactions
+3. Hidden transactions are marked with an "H" in the flags column when visible
+
+This applies to all hidden transactions, including:
+
+- Tracking account transactions
+- Deleted transactions
+- Transfer transactions between accounts
+- Transactions manually marked as hidden (using **`h`** on individual transactions)
+
+See the [Keyboard Shortcuts](keyboard-shortcuts.md) guide for all available commands.
+
+!!! tip
+    If you want to analyze investment contributions or mortgage payments specifically, press `f` to access filter
+    settings and show hidden transactions, then filter by account or use search to find what you need.
+
+---
+
 ## Reset Credentials
 
 If you forget your encryption password or want to reconfigure:

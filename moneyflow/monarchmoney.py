@@ -4,6 +4,9 @@ Monarch Money API Client
 This file is derived from the monarchmoney Python client library:
 https://github.com/hammem/monarchmoney
 
+With authentication fixes from:
+https://github.com/keithah/monarchmoney-enhanced
+
 Copyright (c) 2023 hammem
 Licensed under the MIT License
 
@@ -17,6 +20,7 @@ import json
 import os
 import pickle
 import time
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Union
 
@@ -26,23 +30,74 @@ from gql import Client, gql
 from gql.transport.aiohttp import AIOHTTPTransport
 from graphql import DocumentNode
 
-try:
-    from gql.dsl import DSLExecutable
+def _parse_gql_version(version_str: str) -> tuple:
+    """
+    Parse a gql version string into a comparable tuple of (major, minor, patch).
 
-    GQL_V3_5_PLUS = True
-except ImportError:
-    GQL_V3_5_PLUS = False
+    Examples:
+        "3.5.0" -> (3, 5, 0)
+        "4.0.0" -> (4, 0, 0)
+        "4.2.0b0" -> (4, 2, 0)
+        "3.4.1a1" -> (3, 4, 1)
+
+    Args:
+        version_str: Version string from gql.__version__
+
+    Returns:
+        Tuple of (major, minor, patch) as integers
+    """
+    # Remove build metadata (e.g., "+local")
+    version_str = version_str.split("+")[0]
+
+    # Replace pre-release markers with dots to split them out
+    version_str = version_str.replace("a", ".").replace("b", ".").replace("rc", ".")
+
+    # Extract numeric parts only
+    version_parts = []
+    for part in version_str.split("."):
+        try:
+            version_parts.append(int(part))
+        except ValueError:
+            break  # Stop at first non-numeric part
+
+    # Return first 3 parts (major, minor, patch), pad with 0s if needed
+    return tuple(version_parts[:3] + [0] * (3 - len(version_parts)))
+
+
+def _detect_gql_v4_plus() -> bool:
+    """
+    Detect if the installed gql library is version 4.0+.
+
+    In gql 3.x: execute_async(document=query, ...)
+    In gql 4.0+: execute_async(request=query, ...)
+
+    Returns:
+        True if gql >= 4.0.0, False otherwise
+    """
+    try:
+        import gql as gql_module
+
+        version_tuple = _parse_gql_version(gql_module.__version__)
+        return version_tuple >= (4, 0, 0)
+    except (ImportError, AttributeError, ValueError):
+        # Fallback: assume older version if we can't detect
+        return False
+
+
+# Detect gql version to handle API changes in v4.0+
+GQL_V4_PLUS = _detect_gql_v4_plus()
 
 AUTH_HEADER_KEY = "authorization"
 CSRF_KEY = "csrftoken"
 DEFAULT_RECORD_LIMIT = 100
 ERRORS_KEY = "error_code"
-SESSION_DIR = ".mm"
-SESSION_FILE = f"{SESSION_DIR}/mm_session.pickle"
+# Default session directory (used if profile_dir not provided)
+DEFAULT_SESSION_DIR = ".mm"
+DEFAULT_SESSION_FILE = f"{DEFAULT_SESSION_DIR}/mm_session.pickle"
 
 
 class MonarchMoneyEndpoints(object):
-    BASE_URL = "https://api.monarchmoney.com"
+    BASE_URL = "https://api.monarch.com"
 
     @classmethod
     def getLoginEndpoint(cls) -> str:
@@ -72,20 +127,36 @@ class RequestFailedException(Exception):
 class MonarchMoney(object):
     def __init__(
         self,
-        session_file: str = SESSION_FILE,
+        session_file: Optional[str] = None,
         timeout: int = 10,
         token: Optional[str] = None,
+        profile_dir: Optional[str] = None,
     ) -> None:
         self._headers = {
             "Accept": "application/json",
             "Client-Platform": "web",
             "Content-Type": "application/json",
-            "User-Agent": "MonarchMoneyAPI (https://github.com/hammem/monarchmoney)",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "device-uuid": str(uuid.uuid4()),
+            "Origin": "https://app.monarch.com",
+            "x-cio-client-platform": "web",
+            "x-cio-site-id": "2598be4aa410159198b2",
+            "x-gist-user-anonymous": "false",
         }
         if token:
             self._headers["Authorization"] = f"Token {token}"
 
-        self._session_file = session_file
+        # Determine session file location
+        if session_file is not None:
+            # Explicit session_file path provided - use it
+            self._session_file = session_file
+        elif profile_dir is not None:
+            # Profile directory provided - use .mm inside it
+            self._session_file = os.path.join(profile_dir, ".mm", "mm_session.pickle")
+        else:
+            # Fall back to default (current directory)
+            self._session_file = DEFAULT_SESSION_FILE
+
         self._token = token
         self._timeout = timeout
 
@@ -129,16 +200,32 @@ class MonarchMoney(object):
         """Logs into a Monarch Money account."""
         if use_saved_session and os.path.exists(self._session_file):
             print(f"Using saved session found at {self._session_file}")
-            self.load_session(self._session_file)
-            return
+            try:
+                self.load_session(self._session_file)
+                # Validate the session by making a simple API call
+                # This catches stale/expired tokens that Monarch rejects
+                await self.get_subscription_details()
+                # Session is valid - we're done
+                return
+            except Exception as e:
+                # Session is invalid/corrupt/expired - delete it and continue to fresh login
+                print(f"Saved session invalid ({e}), deleting and attempting fresh login")
+                self.delete_session(self._session_file)
+                # Fall through to normal login below
 
         if (email is None) or (password is None) or (email == "") or (password == ""):
             raise LoginFailedException(
                 "Email and password are required to login when not using a saved session."
             )
-        await self._login_user(email, password, mfa_secret_key)
-        if save_session:
-            self.save_session(self._session_file)
+
+        try:
+            await self._login_user(email, password, mfa_secret_key)
+            if save_session:
+                self.save_session(self._session_file)
+        except (LoginFailedException, RequireMFAException) as e:
+            # Login failed - delete any existing session file to ensure clean retry
+            self.delete_session(self._session_file)
+            raise
 
     async def multi_factor_authenticate(self, email: str, password: str, code: str) -> None:
         """Performs multi-factor authentication to access a Monarch Money account."""
@@ -2825,16 +2912,14 @@ class MonarchMoney(object):
         """
         client = self._get_graphql_client()
 
-        # Handle gql v3.5+ API changes
-        if GQL_V3_5_PLUS:
-            from gql.graphql_request import GraphQLRequest
-
-            request = GraphQLRequest(
+        # Handle gql v4+ API changes (parameter name changed from 'document' to 'request')
+        if GQL_V4_PLUS:
+            # gql 4+ uses 'request' parameter
+            return await client.execute_async(
                 request=graphql_query, operation_name=operation, variable_values=variables
             )
-            return await client.execute_async(request)
         else:
-            # Legacy API for gql < 3.5
+            # gql 3.x uses 'document' parameter
             return await client.execute_async(
                 document=graphql_query, operation_name=operation, variable_values=variables
             )
@@ -2867,13 +2952,27 @@ class MonarchMoney(object):
 
     def delete_session(self, filename: Optional[str] = None) -> None:
         """
-        Deletes the session file.
+        Deletes the session file and its parent directory if it becomes empty.
+
+        This is useful for cleaning up after failed login attempts or
+        when switching accounts.
         """
         if filename is None:
             filename = self._session_file
 
         if os.path.exists(filename):
             os.remove(filename)
+
+            # Clean up empty parent directory (.mm directory)
+            parent_dir = os.path.dirname(filename)
+            if parent_dir and os.path.exists(parent_dir):
+                try:
+                    # Only remove if directory is empty
+                    if not os.listdir(parent_dir):
+                        os.rmdir(parent_dir)
+                except OSError:
+                    # Directory not empty or other error - ignore
+                    pass
 
     async def _login_user(self, email: str, password: str, mfa_secret_key: Optional[str]) -> None:
         """
@@ -2883,10 +2982,12 @@ class MonarchMoney(object):
 
         try:
             data = {
-                "password": password,
-                "supports_mfa": True,
-                "trusted_device": False,
                 "username": email,
+                "password": password,
+                "trusted_device": True,
+                "supports_mfa": True,
+                "supports_email_otp": True,
+                "supports_recaptcha": True,
             }
 
             if mfa_secret_key:
@@ -2902,6 +3003,11 @@ class MonarchMoney(object):
                     MonarchMoneyEndpoints.getLoginEndpoint(), json=data
                 ) as resp:
                     print(f"[DEBUG] Login response status: {resp.status}", file=sys.stderr)
+
+                    # Handle 404 - REST endpoint no longer exists, fallback to GraphQL
+                    if resp.status == 404:
+                        print("[DEBUG] REST login returned 404, trying GraphQL fallback", file=sys.stderr)
+                        return await self._login_user_graphql(email, password, mfa_secret_key)
 
                     if resp.status == 403:
                         raise RequireMFAException("Multi-Factor Auth Required")
@@ -2924,6 +3030,11 @@ class MonarchMoney(object):
             # Re-raise known exceptions as-is
             raise
         except Exception as e:
+            # Check if 404 in exception message - fallback to GraphQL
+            if "404" in str(e):
+                print("[DEBUG] REST login failed with 404, trying GraphQL fallback", file=sys.stderr)
+                return await self._login_user_graphql(email, password, mfa_secret_key)
+
             # Wrap any other exception with context
             import traceback
 
@@ -2933,16 +3044,113 @@ class MonarchMoney(object):
                 f"Unexpected error during login: {type(e).__name__}: {e}"
             ) from e
 
+    async def _login_user_graphql(
+        self, email: str, password: str, mfa_secret_key: Optional[str] = None
+    ) -> None:
+        """
+        GraphQL fallback login method for when REST endpoint is unavailable.
+
+        Args:
+            email: User's email address
+            password: User's password
+            mfa_secret_key: Optional MFA secret key for TOTP generation
+
+        Raises:
+            LoginFailedException: If GraphQL login fails
+        """
+        import sys
+
+        print("[DEBUG] Attempting GraphQL login", file=sys.stderr)
+
+        variables = {
+            "email": email,
+            "password": password,
+            "rememberMe": True,
+        }
+
+        if mfa_secret_key:
+            totp_code = oathtool.generate_otp(mfa_secret_key)
+            variables["totpToken"] = totp_code
+            print("[DEBUG] Added TOTP token to GraphQL login", file=sys.stderr)
+
+        query = gql(
+            """
+            mutation LoginMutation(
+                $email: String!,
+                $password: String!,
+                $totpToken: String,
+                $rememberMe: Boolean
+            ) {
+                login(
+                    email: $email,
+                    password: $password,
+                    totpToken: $totpToken,
+                    rememberMe: $rememberMe
+                ) {
+                    token
+                    user {
+                        id
+                        email
+                        __typename
+                    }
+                    errors {
+                        field
+                        messages
+                        __typename
+                    }
+                    __typename
+                }
+            }
+        """
+        )
+
+        try:
+            result = await self.gql_call(
+                operation="LoginMutation", graphql_query=query, variables=variables
+            )
+
+            login_data = result.get("login", {})
+            errors = login_data.get("errors", [])
+
+            if errors:
+                error_messages = []
+                for error in errors:
+                    messages = error.get("messages", [])
+                    error_messages.extend(messages)
+                error_text = "; ".join(error_messages)
+                print(f"[DEBUG] GraphQL login errors: {error_text}", file=sys.stderr)
+                raise LoginFailedException(f"Login failed: {error_text}")
+
+            token = login_data.get("token")
+            if not token:
+                raise LoginFailedException("No token received from GraphQL login")
+
+            # Update client authentication
+            self.set_token(token)
+            self._headers["Authorization"] = f"Token {self._token}"
+            print("[DEBUG] GraphQL login successful", file=sys.stderr)
+
+        except LoginFailedException:
+            raise
+        except Exception as e:
+            import traceback
+
+            print("\n[DEBUG] Exception during GraphQL login:", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            raise LoginFailedException(f"GraphQL login failed: {type(e).__name__}: {e}") from e
+
     async def _multi_factor_authenticate(self, email: str, password: str, code: str) -> None:
         """
         Performs the MFA step of login.
         """
         data = {
-            "password": password,
-            "supports_mfa": True,
-            "totp": code,
-            "trusted_device": False,
             "username": email,
+            "password": password,
+            "trusted_device": True,
+            "supports_mfa": True,
+            "supports_email_otp": True,
+            "supports_recaptcha": True,
+            "totp": code,
         }
 
         async with ClientSession(headers=self._headers) as session:

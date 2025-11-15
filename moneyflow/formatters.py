@@ -7,7 +7,7 @@ fully typed and testable.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Optional, TypedDict, Union
+from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
 import polars as pl
 from rich.text import Text
@@ -53,6 +53,15 @@ class ViewPresenter:
     This class is stateless and thread-safe. All methods are static
     to emphasize the pure function nature.
     """
+
+    # Map view mode strings to aggregation field names
+    _VIEW_MODE_TO_FIELD = {
+        "merchant": "merchant",
+        "category": "category",
+        "group": "group",
+        "account": "account",
+        "time_period": "time_period_display",
+    }
 
     @staticmethod
     def format_amount(amount: float, for_table: bool = False) -> Union[str, Text]:
@@ -203,6 +212,8 @@ class ViewPresenter:
         sort_direction: SortDirection,
         column_config: Optional[Dict[str, Any]] = None,
         display_labels: Optional[Dict[str, str]] = None,
+        computed_columns: Optional[List[Any]] = None,
+        sort_column: Optional[str] = None,
     ) -> list[ColumnSpec]:
         """
         Prepare column specifications for aggregation views.
@@ -265,11 +276,19 @@ class ViewPresenter:
         }
 
         # Get arrows
-        name_arrow = ViewPresenter.get_sort_arrow(
-            sort_by, sort_direction, field_to_sort_mode[group_by_field]
-        )
-        count_arrow = ViewPresenter.get_sort_arrow(sort_by, sort_direction, SortMode.COUNT)
-        amount_arrow = ViewPresenter.get_sort_arrow(sort_by, sort_direction, SortMode.AMOUNT)
+        # IMPORTANT: If sort_column is set (computed column active), don't show arrows on standard columns
+        if sort_column:
+            # Sorting by computed column, no arrows on standard columns
+            name_arrow = ""
+            count_arrow = ""
+            amount_arrow = ""
+        else:
+            # Standard sorting, show arrows normally
+            name_arrow = ViewPresenter.get_sort_arrow(
+                sort_by, sort_direction, field_to_sort_mode[group_by_field]
+            )
+            count_arrow = ViewPresenter.get_sort_arrow(sort_by, sort_direction, SortMode.COUNT)
+            amount_arrow = ViewPresenter.get_sort_arrow(sort_by, sort_direction, SortMode.AMOUNT)
 
         # Build column specs
         # Total column label - right-aligned to match the values, includes currency
@@ -290,6 +309,38 @@ class ViewPresenter:
         if group_by_field == "merchant":
             columns.append({"label": "Top Category", "key": "top_category_display", "width": 35})
 
+        # Add backend-specific computed columns (before flags)
+        if computed_columns:
+            for col_config in computed_columns:
+                # Only add if this column applies to current view
+                if (
+                    not col_config.view_modes
+                    or ViewPresenter._VIEW_MODE_TO_FIELD.get(
+                        col_config.view_modes[0] if col_config.view_modes else ""
+                    )
+                    == group_by_field
+                    or (
+                        col_config.view_modes
+                        and any(
+                            ViewPresenter._VIEW_MODE_TO_FIELD.get(mode) == group_by_field
+                            for mode in col_config.view_modes
+                        )
+                    )
+                ):
+                    # Check if we're sorting by this computed column
+                    col_arrow = ""
+                    if sort_column and sort_column == col_config.name:
+                        # Show sort arrow for this computed column
+                        col_arrow = "↓" if sort_direction == SortDirection.DESC else "↑"
+
+                    columns.append(
+                        {
+                            "label": f"{col_config.display_name} {col_arrow}".strip(),
+                            "key": col_config.name,
+                            "width": 15,  # Default width for computed columns
+                        }
+                    )
+
         # Flags column (always last)
         columns.append({"label": "", "key": "flags", "width": 2})
 
@@ -302,6 +353,7 @@ class ViewPresenter:
         group_by_field: str = None,
         pending_edit_ids: set[str] = None,
         selected_group_keys: set[str] = None,
+        computed_columns: Optional[List[Any]] = None,
     ) -> list[tuple]:
         """
         Format aggregation DataFrame rows for display.
@@ -375,24 +427,43 @@ class ViewPresenter:
             if name in groups_with_pending_edits:
                 flags += "*"
 
-            # For merchant view, include top category
+            # Build base row data
+            row_data = [
+                name,
+                str(count),
+                ViewPresenter.format_amount(total, for_table=True),
+            ]
+
+            # Add top category for merchant view
             if group_by_field == "merchant":
                 top_category = row_dict.get("top_category", "")
                 top_category_pct = row_dict.get("top_category_pct", 0)
                 top_category_display = f"{top_category} {top_category_pct}%" if top_category else ""
-                rows.append(
-                    (
-                        name,
-                        str(count),
-                        ViewPresenter.format_amount(total, for_table=True),
-                        top_category_display,
-                        flags,
-                    )
-                )
-            else:
-                rows.append(
-                    (name, str(count), ViewPresenter.format_amount(total, for_table=True), flags)
-                )
+                row_data.append(top_category_display)
+
+            # Add computed columns (if they apply to this view)
+            if computed_columns:
+                for col_config in computed_columns:
+                    # Only include if this column applies to current view
+                    if not col_config.view_modes or any(
+                        ViewPresenter._VIEW_MODE_TO_FIELD.get(mode) == group_by_field
+                        for mode in col_config.view_modes
+                    ):
+                        value = row_dict.get(col_config.name)
+                        # Format using custom formatter if provided
+                        if value is not None and col_config.formatter:
+                            formatted_value = col_config.formatter(value)
+                        elif value is not None:
+                            # Default formatting based on type
+                            formatted_value = str(value)
+                        else:
+                            formatted_value = ""
+                        row_data.append(formatted_value)
+
+            # Add flags at the end
+            row_data.append(flags)
+
+            rows.append(tuple(row_data))
 
         return rows
 
@@ -407,6 +478,8 @@ class ViewPresenter:
         selected_group_keys: set[str] = None,
         column_config: Optional[Dict[str, Any]] = None,
         display_labels: Optional[Dict[str, str]] = None,
+        computed_columns: Optional[List[Any]] = None,
+        sort_column: Optional[str] = None,
     ) -> PreparedView:
         """
         Prepare complete aggregation view data.
@@ -440,14 +513,20 @@ class ViewPresenter:
             4
         """
         columns = ViewPresenter.prepare_aggregation_columns(
-            group_by_field, sort_by, sort_direction, column_config, display_labels
+            group_by_field,
+            sort_by,
+            sort_direction,
+            column_config,
+            display_labels,
+            computed_columns,
+            sort_column,
         )
 
         if df.is_empty():
             return PreparedView(columns=columns, rows=[], empty=True)
 
         rows = ViewPresenter.format_aggregation_rows(
-            df, detail_df, group_by_field, pending_edit_ids, selected_group_keys
+            df, detail_df, group_by_field, pending_edit_ids, selected_group_keys, computed_columns
         )
 
         return PreparedView(columns=columns, rows=rows, empty=False)

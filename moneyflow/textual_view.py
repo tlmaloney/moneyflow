@@ -55,9 +55,14 @@ class TextualViewPresenter(IViewPresenter):
                 # Columns match - just clear rows (smooth, no flash)
                 table.clear(columns=False)
 
-        # Add rows
-        for row in rows:
-            table.add_row(*row)
+        # Add rows with explicit keys to avoid RowKey(value=None) issues
+        # For aggregate views, use first column (merchant/category/group/account name) + index
+        # For transaction views, use row index as key
+        for idx, row in enumerate(rows):
+            # Generate unique key using row index to ensure uniqueness
+            # (first column might not always be unique, e.g., duplicate merchants)
+            row_key = f"row_{idx}"
+            table.add_row(*row, key=row_key)
 
     def show_notification(
         self, message: str, severity: NotificationSeverity = "information", timeout: int = 3

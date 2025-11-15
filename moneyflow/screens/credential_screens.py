@@ -7,13 +7,13 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
 from textual.events import Key
-from textual.screen import ModalScreen, Screen
+from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Static
 
 from ..credentials import CredentialManager
 
 
-class BackendSelectionScreen(Screen):
+class BackendSelectionScreen(ModalScreen):
     """
     Backend selection screen for first-time setup.
 
@@ -168,7 +168,7 @@ class BackendSelectionScreen(Screen):
             pass
 
 
-class CredentialSetupScreen(Screen):
+class CredentialSetupScreen(ModalScreen):
     """First-time credential setup screen."""
 
     CSS = """
@@ -281,9 +281,10 @@ class CredentialSetupScreen(Screen):
                     classes="setup-input",
                 )
 
-                yield Label("2FA/TOTP Secret Key:", classes="setup-label")
+                yield Label("2FA/TOTP Secret Key (~32 characters):", classes="setup-label")
                 yield Static(
-                    "Get this from: Settings → Security → Re-enable 2FA → 'Can't scan?'",
+                    "Get this from: Settings → Security → Re-enable 2FA → 'Can't scan?'\n"
+                    "Should be a ~32 character base32 string (not the 6-digit code)",
                     classes="setup-help",
                 )
                 yield Input(
@@ -388,7 +389,7 @@ class CredentialSetupScreen(Screen):
             error_label.update(f"❌ Error saving credentials: {e}")
 
 
-class CredentialUnlockScreen(Screen):
+class CredentialUnlockScreen(ModalScreen):
     """Screen to unlock encrypted credentials."""
 
     def __init__(self, profile_dir: Optional[Path] = None):
@@ -511,9 +512,14 @@ class CredentialUnlockScreen(Screen):
             # Get config_dir from app and pass to CredentialManager
             config_path = Path(self.app.config_dir) if self.app.config_dir else None
             cred_manager = CredentialManager(config_dir=config_path, profile_dir=self.profile_dir)
-            creds = cred_manager.load_credentials(encryption_password=encryption_password)
+            creds, encryption_key = cred_manager.load_credentials(
+                encryption_password=encryption_password
+            )
 
             error_label.update("✅ Unlocked! Logging in...")
+
+            # Store encryption key in app for cache encryption
+            self.app.encryption_key = encryption_key
 
             # Dismiss and return credentials
             self.dismiss(creds)

@@ -4,10 +4,25 @@
 
 **New:**
 
-- **Multi-account support** - Manage multiple Monarch, YNAB, and Amazon accounts from a single interface
-- **Account selector** - Choose accounts on startup with keyboard navigation (↑/↓, Enter)
-- Keyboard navigation for backend selection screens
+- **Time as first-class grouping** - Group by Year/Month/Day alongside Merchant/Category/Account
+- **Day granularity** - New granularity level for daily spending analysis
+- **Time toggle with 't' key** - Cycle through Year/Month/Day granularities
+- **Multi-account support** - Manage multiple Monarch, YNAB, and Amazon accounts from single interface
+- **Account selector** - Choose accounts on startup with keyboard navigation (↑/↓, Enter, j/k)
+- **Profile-local categories** - Each account maintains its own category structure (no conflicts)
+- **Amazon category inheritance** - Auto-inherits categories from Monarch/YNAB if only one profile exists
+- **YNAB:** Batch payee updates - Rename merchant once instead of updating each transaction (100x faster)
+- **YNAB:** Support for non-USD currencies - Display currency symbol from YNAB budget settings
+- Currency symbol in column header (no longer in each amount)
 - Amazon mode integrates with account selector (appears alongside Monarch/YNAB)
+
+**Fixed:**
+
+- 'g' key now returns to aggregate view from top-level detail view
+- Breadcrumb dimensions now display in drill-down order
+- Sort by amount (descending) when drilling into time periods
+- Arrow key bindings now work correctly in account/backend selectors (priority over scroll)
+- Test suite no longer clobbers production config.yaml
 
 ---
 
@@ -45,5 +60,3 @@
 ---
 
 **Upgrade**: `pip install --upgrade moneyflow` or `uvx moneyflow@latest`
-
-**Full history**: [CHANGELOG.md](https://github.com/wesm/moneyflow/blob/main/CHANGELOG.md)

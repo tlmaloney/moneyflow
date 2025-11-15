@@ -494,10 +494,38 @@ class DataManager:
                 "pending": bool(txn.get("pending", False)),
                 "isRecurring": bool(txn.get("isRecurring", False)),
             }
+
+            # Preserve extra backend-specific fields (e.g., Amazon: quantity, asin, order_id, etc.)
+            # Skip fields that were already processed (standard fields or nested objects)
+            # IMPORTANT: Convert all extra fields to strings for schema consistency
+            # Polars requires all rows to have the same schema, and backend data can be inconsistent
+            standard_fields = {
+                "id",
+                "date",
+                "amount",
+                "merchant",
+                "category",
+                "account",
+                "notes",
+                "hideFromReports",
+                "pending",
+                "isRecurring",
+            }
+            for key, value in txn.items():
+                if key not in standard_fields and not isinstance(value, dict):
+                    # Convert to string to ensure schema consistency across all transactions
+                    # This prevents Polars errors when backends have inconsistent field types
+                    if value is None:
+                        row[key] = None
+                    else:
+                        row[key] = str(value)
+
             rows.append(row)
 
         # Create DataFrame
-        df = pl.DataFrame(rows)
+        # Use infer_schema_length=None to scan ALL rows for schema inference
+        # This prevents errors when extra backend fields have inconsistent presence/types
+        df = pl.DataFrame(rows, infer_schema_length=None)
 
         # Convert date column to date type
         df = df.with_columns(pl.col("date").str.strptime(pl.Date, format="%Y-%m-%d"))
@@ -548,12 +576,50 @@ class DataManager:
 
         return df
 
+    def _apply_computed_columns(
+        self, df: pl.DataFrame, computed_columns: List[Any], agg_exprs: List[Any]
+    ) -> None:
+        """
+        Apply computed column aggregations to aggregation expressions list.
+
+        This is a helper to avoid duplicating the aggregation function mapping logic.
+
+        Args:
+            df: DataFrame being aggregated (to check column existence)
+            computed_columns: List of ComputedColumn configurations
+            agg_exprs: List of aggregation expressions to append to (modified in place)
+        """
+        from .backends.base import AggregationFunc
+
+        # Map aggregation functions to Polars methods
+        agg_func_map = {
+            AggregationFunc.FIRST: lambda expr: expr.first(),
+            AggregationFunc.LAST: lambda expr: expr.last(),
+            AggregationFunc.MIN: lambda expr: expr.min(),
+            AggregationFunc.MAX: lambda expr: expr.max(),
+            AggregationFunc.COUNT_DISTINCT: lambda expr: expr.n_unique(),
+            AggregationFunc.SUM: lambda expr: expr.sum(),
+            AggregationFunc.MEAN: lambda expr: expr.mean(),
+        }
+
+        for col_config in computed_columns:
+            # Check if source field exists in DataFrame
+            if col_config.source_field not in df.columns:
+                continue
+
+            # Apply aggregation function
+            col_expr = pl.col(col_config.source_field)
+            agg_func = agg_func_map.get(col_config.aggregation)
+            if agg_func:
+                agg_exprs.append(agg_func(col_expr).alias(col_config.name))
+
     def _aggregate_by_field(
         self,
         df: pl.DataFrame,
         group_field: str,
         include_id: bool = True,
         include_group: bool = False,
+        computed_columns: Optional[List[Any]] = None,
     ) -> pl.DataFrame:
         """
         Generic aggregation method to eliminate duplication.
@@ -566,6 +632,7 @@ class DataManager:
             group_field: Field name to group by ('merchant', 'category', 'group', 'account')
             include_id: Whether to include the field's _id column (e.g., merchant_id)
             include_group: Whether to include group column (for category aggregation)
+            computed_columns: Optional list of ComputedColumn configurations to add
 
         Returns:
             Aggregated DataFrame with columns: [group_field, count, total, ...]
@@ -593,6 +660,10 @@ class DataManager:
         if include_group:
             agg_exprs.append(pl.first("group").alias("group"))
 
+        # Add computed columns if provided
+        if computed_columns:
+            self._apply_computed_columns(df, computed_columns, agg_exprs)
+
         return df.group_by(group_field).agg(agg_exprs)
 
     def aggregate_by_merchant(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -605,6 +676,7 @@ class DataManager:
         - merchant_id: ID of the merchant (for API operations)
         - top_category: Most common category for this merchant
         - top_category_pct: Percentage of transactions in top category
+        - Plus any backend-specific computed columns
 
         Args:
             df: Transaction DataFrame to aggregate
@@ -617,26 +689,39 @@ class DataManager:
         if df.is_empty():
             return pl.DataFrame()
 
-        # Group by merchant and compute aggregations including top category
-        result = df.group_by("merchant").agg(
-            [
-                pl.count("id").alias("count"),
-                # Exclude hidden transactions from totals
-                pl.col("amount").filter(~pl.col("hideFromReports")).sum().alias("total"),
-                pl.first("merchant_id").alias("merchant_id"),
-                # Get most common category and its count
-                pl.col("category")
-                .value_counts(sort=True)
-                .first()
-                .struct.field("category")
-                .alias("top_category"),
-                pl.col("category")
-                .value_counts(sort=True)
-                .first()
-                .struct.field("count")
-                .alias("top_category_count"),
+        # Get computed columns from backend (if any apply to merchant view)
+        computed_cols = []
+        if hasattr(self.mm, "get_computed_columns"):
+            all_computed = self.mm.get_computed_columns()
+            computed_cols = [
+                col for col in all_computed if not col.view_modes or "merchant" in col.view_modes
             ]
-        )
+
+        # Build aggregation expressions
+        agg_exprs = [
+            pl.count("id").alias("count"),
+            # Exclude hidden transactions from totals
+            pl.col("amount").filter(~pl.col("hideFromReports")).sum().alias("total"),
+            pl.first("merchant_id").alias("merchant_id"),
+            # Get most common category and its count
+            pl.col("category")
+            .value_counts(sort=True)
+            .first()
+            .struct.field("category")
+            .alias("top_category"),
+            pl.col("category")
+            .value_counts(sort=True)
+            .first()
+            .struct.field("count")
+            .alias("top_category_count"),
+        ]
+
+        # Add computed columns
+        if computed_cols:
+            self._apply_computed_columns(df, computed_cols, agg_exprs)
+
+        # Group by merchant and compute aggregations including top category
+        result = df.group_by("merchant").agg(agg_exprs)
 
         # Calculate percentage (top_category_count / count * 100)
         result = result.with_columns(
@@ -675,8 +760,20 @@ class DataManager:
 
         Returns:
             Aggregated DataFrame with columns: [account, count, total, account_id]
+            Plus any backend-specific computed columns (e.g., order_date for Amazon)
         """
-        return self._aggregate_by_field(df, "account", include_id=True, include_group=False)
+        # Get computed columns from backend (e.g., order_date for Amazon)
+        computed_cols = []
+        if hasattr(self.mm, "get_computed_columns"):
+            all_computed = self.mm.get_computed_columns()
+            # Filter to columns that apply to ACCOUNT view mode
+            computed_cols = [
+                col for col in all_computed if not col.view_modes or "account" in col.view_modes
+            ]
+
+        return self._aggregate_by_field(
+            df, "account", include_id=True, include_group=False, computed_columns=computed_cols
+        )
 
     def _generate_all_months(self, min_year: int, max_year: int) -> pl.DataFrame:
         """

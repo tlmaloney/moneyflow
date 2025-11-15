@@ -141,6 +141,14 @@ class AppController:
                 "accounts": "Accounts",
             }
 
+    def _get_computed_columns(self) -> list:
+        """Get computed columns from backend, with safe fallback to empty list."""
+        try:
+            return self.data_manager.mm.get_computed_columns()
+        except (AttributeError, Exception):
+            # Fallback to no computed columns if backend doesn't support it
+            return []
+
     def _get_column_config(self) -> dict:
         """Get column configuration from backend, with safe fallback to defaults."""
         try:
@@ -260,13 +268,17 @@ class AppController:
                     agg = aggregate_func(txns)
 
                 # Apply sorting with secondary sort key for deterministic ordering
-                sort_col = self.state.sort_by.value
-                if sort_col == "amount":
-                    sort_col = "total"
-                elif sort_col == "time_period":
-                    sort_col = "time_period_display"
-                elif sort_col in ["merchant", "category", "group", "account"]:
-                    sort_col = field_name
+                # Use sort_column if set (for computed columns), otherwise use sort_by
+                if self.state.sort_column:
+                    sort_col = self.state.sort_column
+                else:
+                    sort_col = self.state.sort_by.value
+                    if sort_col == "amount":
+                        sort_col = "total"
+                    elif sort_col == "time_period":
+                        sort_col = "time_period_display"
+                    elif sort_col in ["merchant", "category", "group", "account"]:
+                        sort_col = field_name
 
                 descending = ViewPresenter.should_sort_descending(
                     sort_col, self.state.sort_direction
@@ -291,6 +303,8 @@ class AppController:
                     selected_group_keys=self.state.selected_group_keys,
                     column_config=self._get_column_config(),
                     display_labels=self._get_display_labels(),
+                    computed_columns=self._get_computed_columns(),
+                    sort_column=self.state.sort_column,
                 )
             else:
                 # Show detail view (normal behavior)
@@ -411,15 +425,19 @@ class AppController:
         agg = aggregate_func(filtered_df)
 
         # Apply sorting with secondary sort key for deterministic ordering
-        sort_col = self.state.sort_by.value
+        # Use sort_column if set (for computed columns), otherwise use sort_by
+        if self.state.sort_column:
+            sort_col = self.state.sort_column
+        else:
+            sort_col = self.state.sort_by.value
 
-        # Map sort field to actual column name in aggregation DataFrame
-        if sort_col == "amount":
-            sort_col = "total"  # Aggregations use "total" not "amount"
-        elif sort_col in ["merchant", "category", "group", "account"]:
-            # Use the grouping field name (e.g., "merchant" column in merchant aggregation)
-            sort_col = field_name
-        # else: "count" stays as "count"
+            # Map sort field to actual column name in aggregation DataFrame
+            if sort_col == "amount":
+                sort_col = "total"  # Aggregations use "total" not "amount"
+            elif sort_col in ["merchant", "category", "group", "account"]:
+                # Use the grouping field name (e.g., "merchant" column in merchant aggregation)
+                sort_col = field_name
+            # else: "count" stays as "count"
 
         descending = ViewPresenter.should_sort_descending(sort_col, self.state.sort_direction)
         if not agg.is_empty():
@@ -442,6 +460,8 @@ class AppController:
             selected_group_keys=self.state.selected_group_keys,
             column_config=self._get_column_config(),
             display_labels=self._get_display_labels(),
+            computed_columns=self._get_computed_columns(),
+            sort_column=self.state.sort_column,
         )
 
     def _prepare_time_aggregate_view(self):
@@ -1002,12 +1022,56 @@ class AppController:
 
             field_sort, field_name = view_to_field_sort.get(view_mode, (SortMode.COUNT, "Count"))
 
-            # Cycle through: Field → Count → Amount → Field
-            if current_sort == field_sort:
+            # Check for backend-specific computed columns to add to sort cycle
+            computed_cols = []
+            if hasattr(self.data_manager.mm, "get_computed_columns"):
+                all_computed = self.data_manager.mm.get_computed_columns()
+                # Filter to columns that apply to this view mode
+                view_mode_str = view_mode.value
+                computed_cols = [
+                    col
+                    for col in all_computed
+                    if not col.view_modes or view_mode_str in col.view_modes
+                ]
+
+            # Standard cycle: Field → Count → Amount → [Computed Columns] → Field
+            # IMPORTANT: Check sort_column FIRST before checking sort_by enum
+            if self.state.sort_column and computed_cols:
+                # Currently on a computed column, find next one or cycle back to field
+                current_idx = next(
+                    (
+                        i
+                        for i, col in enumerate(computed_cols)
+                        if col.name == self.state.sort_column
+                    ),
+                    -1,
+                )
+                if current_idx >= 0 and current_idx < len(computed_cols) - 1:
+                    # Move to next computed column
+                    next_col = computed_cols[current_idx + 1]
+                    self.state.sort_column = next_col.name
+                    return (SortMode.AMOUNT, next_col.display_name)
+                else:
+                    # No more computed columns, cycle back to field
+                    self.state.sort_column = None
+                    return (field_sort, field_name)
+            elif current_sort == field_sort:
+                self.state.sort_column = None  # Clear dynamic column
                 return (SortMode.COUNT, "Count")
             elif current_sort == SortMode.COUNT:
+                self.state.sort_column = None  # Clear dynamic column
                 return (SortMode.AMOUNT, "Amount")
+            elif current_sort == SortMode.AMOUNT:
+                # After Amount, cycle through computed columns if any
+                if computed_cols:
+                    self.state.sort_column = computed_cols[0].name
+                    return (SortMode.AMOUNT, computed_cols[0].display_name)
+                else:
+                    self.state.sort_column = None
+                    return (field_sort, field_name)
             else:
+                # Fallback: cycle back to field
+                self.state.sort_column = None
                 return (field_sort, field_name)
 
     def _get_action_hints(self) -> str:

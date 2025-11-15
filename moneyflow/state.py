@@ -126,6 +126,7 @@ class AppState:
     view_mode: ViewMode = ViewMode.MERCHANT
     sort_by: SortMode = SortMode.AMOUNT  # What to sort by (count/amount/date)
     sort_direction: SortDirection = SortDirection.DESC  # Direction (asc/desc)
+    sort_column: Optional[str] = None  # Dynamic column name for computed column sorting
 
     # Time filtering
     start_date: Optional[date] = None

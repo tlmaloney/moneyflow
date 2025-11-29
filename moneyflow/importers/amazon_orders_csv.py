@@ -125,6 +125,16 @@ def import_amazon_orders(
             skipped_count += 1
             continue
 
+        # Skip cancelled line items (Quantity=0 indicates item was cancelled from order)
+        quantity_str = row.get("Quantity", "1").replace(",", "")
+        try:
+            quantity = int(quantity_str)
+        except ValueError:
+            quantity = 1
+        if quantity == 0:
+            skipped_count += 1
+            continue
+
         # Generate transaction ID with sequence number for duplicates
         # (Amazon CSV sometimes has duplicate rows for same ASIN+Order)
         base_key = (asin, order_id)
@@ -156,7 +166,6 @@ def import_amazon_orders(
             product_name = "Unknown Item"
 
         try:
-            quantity = int(row.get("Quantity", "1").replace(",", ""))
             total_owed_str = row.get("Total Owed", "0.0").replace(",", "")
             total_owed = float(total_owed_str)
             amount = -total_owed  # Negative for expenses
@@ -164,6 +173,20 @@ def import_amazon_orders(
             # Skip rows with invalid amounts
             skipped_count += 1
             continue
+
+        # Skip "Try Before You Buy" returns (no charge applied but had a unit price)
+        # These have Total Owed=0, Shipment Item Subtotal=0, but Unit Price > 0
+        if total_owed == 0:
+            try:
+                subtotal_str = row.get("Shipment Item Subtotal", "0").replace(",", "")
+                unit_price_str = row.get("Unit Price", "0").replace(",", "")
+                subtotal = float(subtotal_str) if subtotal_str else 0
+                unit_price = float(unit_price_str) if unit_price_str else 0
+                if subtotal == 0 and unit_price > 0:
+                    skipped_count += 1
+                    continue
+            except (ValueError, AttributeError):
+                pass  # If parsing fails, don't skip
 
         shipment_status = row.get("Shipment Status", "")
 
